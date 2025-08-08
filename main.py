@@ -1,11 +1,10 @@
-# file: main.py 
+# file: main.py
 
 import argparse
 import json
 import os
 import time
 from pathlib import Path
-import shutil
 
 import numpy as np
 import torch
@@ -14,169 +13,220 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dataset import MyDataset
+# 假设您的模型文件名是 model.py
 from model import GenerativeFeatureSASRec
-
 
 def get_args():
     parser = argparse.ArgumentParser()
-    
     parser.add_argument('--batch_size', default=512, type=int)
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
-    parser.add_argument('--hidden_units', default=128, type=int)
-    parser.add_argument('--num_blocks', default=4, type=int)
-    parser.add_argument('--num_epochs', default=50, type=int)
-    parser.add_argument('--num_heads', default=1, type=int)
-    parser.add_argument('--dropout_rate', default=0.2, type=float)
-    parser.add_argument('--l2_emb', default=0.0, type=float) # 保留此参数以防万一
+    parser.add_argument('--num_epochs', default=20, type=int)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
-    parser.add_argument('--norm_first', action='store_true')
-    parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
-    parser.add_argument('--latent_dim', default=128, type=int)
-    parser.add_argument('--mm_hidden_channels', nargs='+', type=int, default=[256])
-    parser.add_argument('--triplet_margin', default=1.0, type=float, help='Margin for TripletMarginLoss')
     
+    # 注意: Baseline的log频率是按step, 这里保留您的设计
+    parser.add_argument('--log_freq', default=100, type=int, help='Log training status every N steps.')
+
+    parser.add_argument('--hidden_units', default=128, type=int)
+    parser.add_argument('--num_blocks', default=2, type=int)
+    parser.add_argument('--num_heads', default=1, type=int)
+    parser.add_argument('--dropout_rate', default=0.2, type=float)
+    parser.add_argument('--l2_emb', default=0.0, type=float)
+    parser.add_argument('--norm_first', action='store_true')
+
+    parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
+    parser.add_argument('--latent_dim', default=128, type=int, help='Latent dimension for multi-modal autoencoders')
+    parser.add_argument('--mm_hidden_channels', nargs='+', type=int, default=[256], help='Hidden channels for autoencoders')
+    parser.add_argument('--triplet_margin', default=1.0, type=float, help='Margin for TripletMarginLoss')
+    parser.add_argument('--recon_loss_weight', default=0.1, type=float, help='Weight for reconstruction loss')
+
     return parser.parse_args()
 
 
 if __name__ == '__main__':
     args = get_args()
-    log_path = Path(os.environ.get('TRAIN_LOG_PATH', f'./logs/{args.hidden_units}_{args.num_blocks}'))
-    tf_events_path = Path(os.environ.get('TRAIN_TF_EVENTS_PATH', f'./tf_events/{args.hidden_units}_{args.num_blocks}'))
-    ckpt_path = Path(os.environ.get('TRAIN_CKPT_PATH', f'./ckpts/{args.hidden_units}_{args.num_blocks}'))
-    log_path.mkdir(parents=True, exist_ok=True); tf_events_path.mkdir(parents=True, exist_ok=True); ckpt_path.mkdir(parents=True, exist_ok=True)
-    log_file = open(log_path / 'train.log', 'w')
-    writer = SummaryWriter(str(tf_events_path))
-    data_path = os.environ.get('TRAIN_DATA_PATH', './data')
+    
+    # --- MODIFICATION: 路径管理严格遵守Baseline规范 ---
+    log_dir = Path(os.environ.get('TRAIN_LOG_PATH'))
+    tf_events_dir = Path(os.environ.get('TRAIN_TF_EVENTS_PATH'))
+    ckpt_dir = Path(os.environ.get('TRAIN_CKPT_PATH'))
+    data_path = os.environ.get('TRAIN_DATA_PATH')
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    tf_events_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True) # 确保根目录存在
+
+    log_file = open(log_dir / 'train.log', 'w')
+    writer = SummaryWriter(str(tf_events_dir))
 
     dataset = MyDataset(data_path, args)
+    
     torch.manual_seed(42)
+    # 拆分数据集
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
     
-    # 建议在平台上将worker数量固定为一个较小的值
-    data_loader_workers = min(4, os.cpu_count() or 1)
-    print(f"Using {data_loader_workers} workers for data loading.")
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=data_loader_workers, collate_fn=dataset.collate_fn_optimized, pin_memory=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=data_loader_workers, collate_fn=dataset.collate_fn_optimized, pin_memory=True)
+    # --- MODIFICATION: 更新DataLoader以适配新的collate_fn ---
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=4, 
+        collate_fn=train_dataset.dataset.collate_fn_wrapper, 
+        pin_memory=True
+    )
+    valid_loader = DataLoader(
+        valid_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=4, 
+        collate_fn=valid_dataset.dataset.collate_fn_wrapper, 
+        pin_memory=True
+    )
     
     model = GenerativeFeatureSASRec(dataset.usernum, dataset.itemnum, dataset.feat_statistics, dataset.feature_types, args).to(args.device)
     
-    # ... (模型初始化等代码保持不变) ...
+    # 模型初始化
     for name, param in model.named_parameters():
         try: torch.nn.init.xavier_normal_(param.data)
         except: pass
-    model.pos_emb.weight.data[0, :] = 0; model.item_emb.weight.data[0, :] = 0; model.user_emb.weight.data[0, :] = 0
-    for k in model.sparse_emb: model.sparse_emb[k].weight.data[0, :] = 0
+    if hasattr(model, 'pos_emb'): model.pos_emb.weight.data[0, :] = 0
+    if hasattr(model, 'item_emb'): model.item_emb.weight.data[0, :] = 0
+    if hasattr(model, 'user_emb'): model.user_emb.weight.data[0, :] = 0
+    if hasattr(model, 'sparse_emb'):
+        for k in model.sparse_emb: model.sparse_emb[k].weight.data[0, :] = 0
+
     epoch_start_idx = 1
     if args.state_dict_path:
         try:
             model.load_state_dict(torch.load(args.state_dict_path, map_location=args.device))
-            epoch_start_idx = int(args.state_dict_path.split('epoch=')[1].split('.')[0]) + 1
-        except: print(f'Failed loading state_dicts from: {args.state_dict_path}')
+            # 尝试从文件名解析epoch，如果格式不同则从1开始
+            tail = args.state_dict_path.split('epoch=')[1]
+            epoch_start_idx = int(tail.split('.')[0]) + 1
+        except Exception:
+            print(f'Failed to parse epoch from {args.state_dict_path}, starting from epoch 1.')
 
     triplet_criterion = torch.nn.TripletMarginLoss(margin=args.triplet_margin, reduction='mean')
-    print(f"Using TripletMarginLoss with margin={args.triplet_margin}")
-    
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
+
+    global_step = 0
     
-    best_valid_loss, best_epoch, global_step = float('inf'), 0, 0
-    last_best_ckpt_dir = None # 用于追踪上一个最佳模型的目录
+    print("Start training with GenerativeFeatureSASRec model.\n")
     
-    print("Start training\n")
     for epoch in range(epoch_start_idx, args.num_epochs + 1):
         model.train()
         if args.inference_only: break
         
         total_loss_sum, rec_loss_sum, recon_loss_sum, train_step_count = 0.0, 0.0, 0.0, 0
-        tqdm_loader = tqdm(train_loader, desc=f"Epoch {epoch}/{args.num_epochs} [Train]")
         
-        for batch in tqdm_loader:
+        tqdm_loader = tqdm(train_loader, desc=f"Epoch {epoch}/{args.num_epochs} [Train]")
+        for step, batch in enumerate(tqdm_loader):
             seq, pos, neg, token_type, next_token_type, _, seq_feat, pos_feat, neg_feat = batch
-            seq, pos, neg, next_token_type = seq.to(args.device), pos.to(args.device), neg.to(args.device), next_token_type.to(args.device)
-            anchor_embs, pos_embs, neg_embs, recon_loss = model(seq, pos, neg, token_type, next_token_type, None, seq_feat, pos_feat, neg_feat)
+            
+            # 将数据移动到设备
+            seq, pos, neg, token_type, next_token_type = [x.to(args.device) for x in (seq, pos, neg, token_type, next_token_type)]
+            seq_feat = {k: v.to(args.device) for k, v in seq_feat.items()}
+            pos_feat = {k: v.to(args.device) for k, v in pos_feat.items()}
+            neg_feat = {k: v.to(args.device) for k, v in neg_feat.items()}
+            
+            anchor_embs, pos_embs, neg_embs, recon_loss = model(
+                seq, pos, neg, token_type, next_token_type, None, seq_feat, pos_feat, neg_feat
+            )
+            
             optimizer.zero_grad()
-            indices = torch.where(next_token_type == 1)
-            rec_loss = triplet_criterion(anchor_embs[indices], pos_embs[indices], neg_embs[indices])
-            loss = rec_loss + recon_loss
-            if args.l2_emb > 0:
-                for param in model.item_emb.parameters(): loss += args.l2_emb * torch.norm(param)
-            loss.backward(); optimizer.step()
-            total_loss_sum += loss.item()
-            rec_loss_sum += rec_loss.item()
-            recon_loss_sum += recon_loss.item()
-            train_step_count += 1
-            writer.add_scalar('Loss/train_step', loss.item(), global_step)
+            indices = torch.where(next_token_type.flatten() == 1)[0]
+            
+            loss_val, rec_loss_val, recon_loss_val = 0.0, 0.0, 0.0
+            if len(indices) > 0:
+                rec_loss = triplet_criterion(
+                    anchor_embs.view(-1, anchor_embs.shape[-1])[indices], 
+                    pos_embs.view(-1, pos_embs.shape[-1])[indices], 
+                    neg_embs.view(-1, neg_embs.shape[-1])[indices]
+                )
+                loss = rec_loss + args.recon_loss_weight * recon_loss
+                
+                if args.l2_emb > 0:
+                    # 假设item_emb是主要的嵌入层
+                    for param in model.item_emb.parameters(): loss += args.l2_emb * torch.norm(param)
+                
+                loss.backward()
+                optimizer.step()
+
+                loss_val, rec_loss_val, recon_loss_val = loss.item(), rec_loss.item(), recon_loss.item()
+                total_loss_sum += loss_val
+                rec_loss_sum += rec_loss_val
+                recon_loss_sum += recon_loss.item()
+                train_step_count += 1
+                
+                # --- MODIFICATION: 按Baseline格式写入日志文件 ---
+                if (step + 1) % args.log_freq == 0:
+                    log_json = json.dumps({
+                        'global_step': global_step, 
+                        'loss': loss_val, 
+                        'rec_loss': rec_loss_val, 
+                        'recon_loss': recon_loss_val, 
+                        'epoch': epoch, 
+                        'time': time.time()
+                    })
+                    log_file.write(log_json + '\n')
+                    log_file.flush()
+                    print(log_json) # 同时打印到控制台，方便调试
+
+            writer.add_scalar('Loss/train_step_total', loss_val, global_step)
+            tqdm_loader.set_postfix(loss=loss_val)
             global_step += 1
-            tqdm_loader.set_postfix(loss=loss.item())
-
-        avg_total_loss = total_loss_sum / train_step_count if train_step_count > 0 else 0
-        avg_rec_loss = rec_loss_sum / train_step_count if train_step_count > 0 else 0
-        avg_recon_loss = recon_loss_sum / train_step_count if train_step_count > 0 else 0
-        writer.add_scalar('Loss/train_epoch_total', avg_total_loss, epoch)
-        writer.add_scalar('Loss/train_epoch_rec', avg_rec_loss, epoch)
-        writer.add_scalar('Loss/train_epoch_recon', avg_recon_loss, epoch)
-
+        
+        avg_train_total_loss = total_loss_sum / train_step_count if train_step_count > 0 else 0
+        avg_train_rec_loss = rec_loss_sum / train_step_count if train_step_count > 0 else 0
+        avg_train_recon_loss = recon_loss_sum / train_step_count if train_step_count > 0 else 0
+        writer.add_scalar('Loss/train_epoch_total', avg_train_total_loss, epoch)
+        
+        # Validation loop
         model.eval()
-        valid_loss_sum, valid_rec_loss_sum, valid_recon_loss_sum = 0.0, 0.0, 0.0
+        valid_loss_sum, valid_rec_loss_sum, valid_recon_loss_sum, valid_step_count = 0.0, 0.0, 0.0, 0
         with torch.no_grad():
             for batch in tqdm(valid_loader, desc=f"Epoch {epoch}/{args.num_epochs} [Valid]"):
                 seq, pos, neg, token_type, next_token_type, _, seq_feat, pos_feat, neg_feat = batch
-                seq, pos, neg, next_token_type = seq.to(args.device), pos.to(args.device), neg.to(args.device), next_token_type.to(args.device)
-                anchor_embs, pos_embs, neg_embs, recon_loss = model(seq, pos, neg, token_type, next_token_type, None, seq_feat, pos_feat, neg_feat)
-                indices = torch.where(next_token_type == 1)
-                rec_loss = triplet_criterion(anchor_embs[indices], pos_embs[indices], neg_embs[indices])
-                valid_loss_sum += (rec_loss + recon_loss).item()
-                valid_rec_loss_sum += rec_loss.item()
-                valid_recon_loss_sum += recon_loss.item()
-        num_valid_batches = len(valid_loader) if valid_loader else 1
-        valid_loss_avg = valid_loss_sum / num_valid_batches
-        valid_rec_loss_avg = valid_rec_loss_sum / num_valid_batches
-        valid_recon_loss_avg = valid_recon_loss_sum / num_valid_batches
-        writer.add_scalar('Loss/valid_epoch_total', valid_loss_avg, epoch)
-        writer.add_scalar('Loss/valid_epoch_rec', valid_rec_loss_avg, epoch)
-        writer.add_scalar('Loss/valid_epoch_recon', valid_recon_loss_avg, epoch)
-        print(f"Epoch: {epoch:03d} | Train Loss: {avg_total_loss:.4f} (Rec: {avg_rec_loss:.4f}, Recon: {avg_recon_loss:.4f}) "
-              f"| Valid Loss: {valid_loss_avg:.4f} (Rec: {valid_rec_loss_avg:.4f}, Recon: {valid_recon_loss_avg:.4f})")
-        
-        if valid_loss_avg < best_valid_loss:
-            best_valid_loss, best_epoch = valid_loss_avg, epoch
-            
-            # 1. 创建符合平台规范的目录 (您的代码已正确实现)
-            save_dir = Path(ckpt_path, f"global_step_{global_step}_epoch_{epoch}_loss_{valid_loss_avg:.4f}")
-            save_dir.mkdir(parents=True, exist_ok=True)
-            
-            # 2. 保存模型到该目录中
-            model_path = save_dir / "model.pt"
-            torch.save(model.state_dict(), model_path)
-            
-            print(f"🎉 New best model at epoch {best_epoch}. Saved to: {model_path}")
-            
-            # 3.在ckpt_path根目录下创建一个符号链接，指向新的最佳模型
-            symlink_path = ckpt_path / "model.pt"
-            if symlink_path.is_symlink():
-                print(f"   Removing old symlink: {symlink_path}")
-                symlink_path.unlink()
-            elif symlink_path.exists(): # 如果是一个实体文件，也删掉
-                print(f"   Removing old file: {symlink_path}")
-                symlink_path.unlink()
+                seq, pos, neg, token_type, next_token_type = [x.to(args.device) for x in (seq, pos, neg, token_type, next_token_type)]
+                seq_feat = {k: v.to(args.device) for k, v in seq_feat.items()}
+                pos_feat = {k: v.to(args.device) for k, v in pos_feat.items()}
+                neg_feat = {k: v.to(args.device) for k, v in neg_feat.items()}
+
+                anchor_embs, pos_embs, neg_embs, recon_loss = model(
+                    seq, pos, neg, token_type, next_token_type, None, seq_feat, pos_feat, neg_feat
+                )
                 
-            os.symlink(model_path, symlink_path)
-            print(f"   Created symlink for inference: {symlink_path} -> {model_path}")
-
-            # 4. 删除上一个最佳模型的目录以节省空间
-            if last_best_ckpt_dir and last_best_ckpt_dir.exists():
-                print(f"   Removing old best checkpoint directory: {last_best_ckpt_dir}")
-                shutil.rmtree(last_best_ckpt_dir)
-            
-            last_best_ckpt_dir = save_dir
-            
-        else:
-            print(f"Validation loss did not improve. Best so far: {best_valid_loss:.4f} at epoch {best_epoch}.")
+                indices = torch.where(next_token_type.flatten() == 1)[0]
+                if len(indices) > 0:
+                    rec_loss = triplet_criterion(
+                        anchor_embs.view(-1, anchor_embs.shape[-1])[indices], 
+                        pos_embs.view(-1, pos_embs.shape[-1])[indices], 
+                        neg_embs.view(-1, neg_embs.shape[-1])[indices]
+                    )
+                    valid_loss_sum += (rec_loss + args.recon_loss_weight * recon_loss).item()
+                    valid_rec_loss_sum += rec_loss.item()
+                    valid_recon_loss_sum += recon_loss.item()
+                    valid_step_count +=1
         
-        print("-" * 80) 
+        avg_valid_total_loss = valid_loss_sum / valid_step_count if valid_step_count > 0 else 0
+        writer.add_scalar('Loss/valid_epoch_total', avg_valid_total_loss, epoch)
 
-    print("="*30, f"\nDone training. Best model from epoch {best_epoch} saved at {last_best_ckpt_dir}", "="*30, sep='\n')
-    writer.close(); log_file.close()
+        tqdm.write("-" * 100)
+        tqdm.write(f"Epoch: {epoch:03d} | "
+                   f"Train Loss: {avg_train_total_loss:.4f} | "
+                   f"Valid Loss: {avg_valid_total_loss:.4f}")
+        
+        # --- MODIFICATION: 模型保存严格遵守Baseline规范 ---
+        save_dir = Path(ckpt_dir, f"global_step{global_step}.valid_loss={avg_valid_total_loss:.4f}")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), save_dir / "model.pt")
+        tqdm.write(f"Model saved to: {save_dir}")
+        tqdm.write("-" * 100)
+        
+    tqdm.write("\n" + "="*40)
+    tqdm.write("Training Finished!")
+    tqdm.write("="*40)
+
+    writer.close()
+    log_file.close()
