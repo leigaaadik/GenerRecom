@@ -32,7 +32,7 @@ def get_args():
 
     # Baseline Model construction (Modified Size)
     parser.add_argument('--hidden_units', default=128, type=int)  # Changed from 256 to 128
-    parser.add_argument('--num_blocks', default=6, type=int)
+    parser.add_argument('--num_blocks', default=4, type=int)
     parser.add_argument('--num_epochs', default=10, type=int)
     parser.add_argument('--num_heads', default=4, type=int)       # Changed from 8 to 4
     parser.add_argument('--dropout_rate', default=0.2, type=float)
