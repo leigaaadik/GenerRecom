@@ -10,193 +10,161 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import MyTestDataset, save_emb
-from model import GenerativeFeatureSASRec
+from model import BaselineModel
 
 
 def get_ckpt_path():
     ckpt_path = os.environ.get("MODEL_OUTPUT_PATH")
     if ckpt_path is None:
-        raise ValueError("MODEL_OUTPUT_PATH environment variable is not set")
+        raise ValueError("MODEL_OUTPUT_PATH is not set")
     for item in os.listdir(ckpt_path):
         if item.endswith(".pt"):
             return os.path.join(ckpt_path, item)
-    raise FileNotFoundError(f"No .pt file found in {ckpt_path}")
 
 
 def get_args():
-    """获取与训练时兼容的参数"""
     parser = argparse.ArgumentParser()
-    # 基本参数
-    parser.add_argument('--batch_size', default=512, type=int)
+
+    # Train params
+    parser.add_argument('--batch_size', default=128, type=int)
+    parser.add_argument('--lr', default=0.0005, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
-    parser.add_argument('--device', default='cuda', type=str)
-    
-    # 模型结构参数 (与main.py同步)
-    parser.add_argument('--hidden_units', default=128, type=int)
-    parser.add_argument('--num_blocks', default=2, type=int)
-    parser.add_argument('--num_heads', default=1, type=int)
+
+    # Baseline Model construction (Modified Size)
+    parser.add_argument('--hidden_units', default=128, type=int)  # Changed from 256 to 128
+    parser.add_argument('--num_blocks', default=6, type=int)
+    parser.add_argument('--num_epochs', default=10, type=int)
+    parser.add_argument('--num_heads', default=4, type=int)       # Changed from 8 to 4
     parser.add_argument('--dropout_rate', default=0.2, type=float)
+    parser.add_argument('--l2_emb', default=0.0, type=float)
+    parser.add_argument('--device', default='cuda', type=str)
+    parser.add_argument('--inference_only', action='store_true')
+    parser.add_argument('--state_dict_path', default=None, type=str)
     parser.add_argument('--norm_first', action='store_true')
 
-    # 多模态与损失函数参数 (与main.py同步)
+    # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
-    parser.add_argument('--latent_dim', default=128, type=int)
-    parser.add_argument('--mm_hidden_channels', nargs='+', type=int, default=[256])
 
-    # 未在推理中直接使用但为了兼容性保留的参数
-    parser.add_argument('--lr', default=0.001, type=float)
-    parser.add_argument('--num_epochs', default=20, type=int)
-    parser.add_argument('--l2_emb', default=0.0, type=float)
-    parser.add_argument('--inference_only', action='store_true', default=True)
-    parser.add_argument('--state_dict_path', default=None, type=str)
-    parser.add_argument('--triplet_margin', default=1.0, type=float)
-    parser.add_argument('--recon_loss_weight', default=0.1, type=float)
+    args = parser.parse_args()
 
-    return parser.parse_args()
+    return args
 
 
 def read_result_ids(file_path):
-    """读取FAISS生成的二进制结果文件"""
     with open(file_path, 'rb') as f:
         num_points_query = struct.unpack('I', f.read(4))[0]
         query_ann_top_k = struct.unpack('I', f.read(4))[0]
-        print(f"Reading ANN results: num_queries={num_points_query}, top_k={query_ann_top_k}")
+        print(f"num_points_query: {num_points_query}, query_ann_top_k: {query_ann_top_k}")
         num_result_ids = num_points_query * query_ann_top_k
         result_ids = np.fromfile(f, dtype=np.uint64, count=num_result_ids)
         return result_ids.reshape((num_points_query, query_ann_top_k))
 
 
-def get_candidate_emb(dataset, model):
-    """
-    生产候选库item的id和embedding
+def process_cold_start_feat(feat):
+    processed_feat = {}
+    for feat_id, feat_value in feat.items():
+        if type(feat_value) == list:
+            value_list = []
+            for v in feat_value:
+                if type(v) == str: value_list.append(0)
+                else: value_list.append(v)
+            processed_feat[feat_id] = value_list
+        elif type(feat_value) == str: processed_feat[feat_id] = 0
+        else: processed_feat[feat_id] = feat_value
+    return processed_feat
 
-    Args:
-        indexer: 索引字典
-        feat_types: 特征类型，分为user和item的sparse, array, emb, continual类型
-        feature_default_value: 特征缺省值
-        mm_emb_dict: 多模态特征字典
-        model: 模型
-    Returns:
-        retrieve_id2creative_id: 索引id->creative_id的dict
-    """
-    eval_data_path = Path(os.environ.get('EVAL_DATA_PATH'))
-    eval_result_path = Path(os.environ.get('EVAL_RESULT_PATH'))
-    eval_result_path.mkdir(parents=True, exist_ok=True)
-    
-    candidate_path = eval_data_path / 'predict_set.jsonl'
-    
-    item_ids, retrieval_ids, features_list = [], [], []
+
+def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, model):
+    EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
+    candidate_path = Path(os.environ.get('EVAL_DATA_PATH'), 'predict_set.jsonl')
+    item_ids, creative_ids, retrieval_ids, features = [], [], [], []
     retrieve_id2creative_id = {}
 
     with open(candidate_path, 'r') as f:
         for line in f:
-            data = json.loads(line)
-            creative_id = data['creative_id']
-            retrieval_id = data['retrieval_id']
-            
-            item_id = dataset.indexer['i'].get(creative_id, 0)
-            features = dataset._process_cold_start_feat(data.get('features', {}))
-            filled_features = dataset.fill_missing_feat(features, item_id)
-            
+            line = json.loads(line)
+            feature = line['features']
+            creative_id = line['creative_id']
+            retrieval_id = line['retrieval_id']
+            item_id = indexer[creative_id] if creative_id in indexer else 0
+            missing_fields = set(
+                feat_types['item_sparse'] + feat_types['item_array'] + feat_types['item_continual']
+            ) - set(feature.keys())
+            feature = process_cold_start_feat(feature)
+            for feat_id in missing_fields:
+                feature[feat_id] = feat_default_value[feat_id]
+            for feat_id in feat_types['item_emb']:
+                if creative_id in mm_emb_dict[feat_id]:
+                    feature[feat_id] = mm_emb_dict[feat_id][creative_id]
+                else:
+                    feature[feat_id] = np.zeros(EMB_SHAPE_DICT[feat_id], dtype=np.float32)
+
             item_ids.append(item_id)
+            creative_ids.append(creative_id)
             retrieval_ids.append(retrieval_id)
-            features_list.append(filled_features)
+            features.append(feature)
             retrieve_id2creative_id[retrieval_id] = creative_id
 
-    if hasattr(model, 'save_item_emb'):
-        model.save_item_emb(item_ids, retrieval_ids, features_list, dataset, str(eval_result_path))
-    else:
-        print("Warning: model.save_item_emb not found. Using generic predict method.")
-        all_embs = []
-        pass
-
-    # 保存ID映射文件
-    with open(eval_result_path / "retrive_id2creative_id.json", "w") as f:
+    model.save_item_emb(item_ids, retrieval_ids, features, os.environ.get('EVAL_RESULT_PATH'))
+    with open(Path(os.environ.get('EVAL_RESULT_PATH'), "retrive_id2creative_id.json"), "w") as f:
         json.dump(retrieve_id2creative_id, f)
-        
     return retrieve_id2creative_id
 
 
 def infer():
-    """主推理函数"""
     args = get_args()
-    
-    data_path = Path(os.environ.get('EVAL_DATA_PATH'))
-    result_path = Path(os.environ.get('EVAL_RESULT_PATH'))
-    result_path.mkdir(parents=True, exist_ok=True)
-    
+    data_path = os.environ.get('EVAL_DATA_PATH')
     test_dataset = MyTestDataset(data_path, args)
-    
     test_loader = DataLoader(
-        test_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=False, 
-        num_workers=4, 
-        collate_fn=test_dataset.collate_fn_wrapper,
-        pin_memory=True
+        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=test_dataset.collate_fn
     )
-    
-    model = GenerativeFeatureSASRec(
-        test_dataset.usernum, 
-        test_dataset.itemnum, 
-        test_dataset.feat_statistics, 
-        test_dataset.feature_types, 
-        args
-    ).to(args.device)
+    usernum, itemnum = test_dataset.usernum, test_dataset.itemnum
+    feat_statistics, feat_types = test_dataset.feat_statistics, test_dataset.feature_types
+    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
     model.eval()
 
     ckpt_path = get_ckpt_path()
-    print(f"Loading model checkpoint from: {ckpt_path}")
     model.load_state_dict(torch.load(ckpt_path, map_location=torch.device(args.device)))
-    
-    all_user_embs = []
-    all_user_ids = []
+    all_embs = []
+    user_list = []
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Generating User Embeddings"):
-            seq, token_type, seq_feat, user_ids_batch = batch
-            
-            seq, token_type = seq.to(args.device), token_type.to(args.device)
-            seq_feat = {k: v.to(args.device) for k, v in seq_feat.items()}
+        for step, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
+            seq, token_type, seq_feat, user_id = batch
+            seq = seq.to(args.device)
+            logits = model.predict(seq, seq_feat, token_type)
+            all_embs.append(logits.detach().cpu().numpy().astype(np.float32))
+            user_list.extend(user_id)
 
-            user_embs = model.predict(seq, seq_feat, token_type)
-            
-            all_user_embs.append(user_embs.cpu().numpy())
-            all_user_ids.extend(user_ids_batch)
-
-    all_user_embs = np.concatenate(all_user_embs, axis=0).astype(np.float32)
-    save_emb(all_user_embs, result_path / 'query.fbin')
-
-    print("Generating candidate item embeddings...")
-    retrieve_id2creative_id = get_candidate_emb(test_dataset, model)
-
-    print("Performing ANN search with FAISS...")
-    dataset_vector_file = result_path / "embedding.fbin"
-    dataset_id_file = result_path / "id.u64bin"
-    query_vector_file = result_path / "query.fbin"
-    result_id_file = result_path / "id100.u64bin"
-
+    retrieve_id2creative_id = get_candidate_emb(
+        test_dataset.indexer['i'],
+        test_dataset.feature_types,
+        test_dataset.feature_default_value,
+        test_dataset.mm_emb_dict,
+        model,
+    )
+    all_embs = np.concatenate(all_embs, axis=0)
+    save_emb(all_embs, Path(os.environ.get('EVAL_RESULT_PATH'), 'query.fbin'))
+    
     ann_cmd = (
-        f"/workspace/faiss-based-ann/faiss_demo "
-        f"--dataset_vector_file_path={dataset_vector_file} "
-        f"--dataset_id_file_path={dataset_id_file} "
-        f"--query_vector_file_path={query_vector_file} "
-        f"--result_id_file_path={result_id_file} "
-        f"--query_ann_top_k=10 --faiss_M=64 --faiss_ef_construction=1280 "
-        f"--query_ef_search=640 --faiss_metric_type=0"
+        str(Path("/workspace", "faiss-based-ann", "faiss_demo"))
+        + " --dataset_vector_file_path="
+        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "embedding.fbin"))
+        + " --dataset_id_file_path="
+        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "id.u64bin"))
+        + " --query_vector_file_path="
+        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "query.fbin"))
+        + " --result_id_file_path="
+        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
+        + " --query_ann_top_k=10 --faiss_M=64 --faiss_ef_construction=1280 --query_ef_search=640 --faiss_metric_type=0"
     )
     os.system(ann_cmd)
 
-    print("Processing search results...")
-    top10s_retrieved = read_result_ids(result_id_file)
-    final_results = []
-    for top10_retrieval_ids in tqdm(top10s_retrieved, desc="Mapping result IDs"):
-        user_top10 = [retrieve_id2creative_id.get(int(rid), 0) for rid in top10_retrieval_ids]
-        final_results.append(user_top10)
+    top10s_retrieved = read_result_ids(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
+    top10s_untrimmed = []
+    for top10 in tqdm(top10s_retrieved):
+        for item in top10:
+            top10s_untrimmed.append(retrieve_id2creative_id.get(int(item), 0))
 
-    return final_results, all_user_ids
+    top10s = [top10s_untrimmed[i : i + 10] for i in range(0, len(top10s_untrimmed), 10)]
 
-if __name__ == "__main__":
-    top10s, user_list = infer()
-    print(f"\nInference finished. Generated recommendations for {len(user_list)} users.")
-    for i in range(min(5, len(user_list))):
-        print(f"User: {user_list[i]}, Recommendations: {top10s[i]}")
+    return top10s, user_list

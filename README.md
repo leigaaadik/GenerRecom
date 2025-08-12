@@ -43,10 +43,7 @@ bash run.sh         # 开始训练
 
 脚本会自动设置所有环境变量并调用 `main.py`；  
 
-
->- 这一版的模型训练时间极慢，约30min/eposh
->- 实际推理效果不佳，得分较低
->- 拟做消融实验，消除部分特征以及RQVAE组件验证效果
->>- Score: 0.0238746
->>- NDCG@10: 0.018342
->>- HitRate@10: 0.0361892
+>- scale up + warm up + weight decay + AdamW + RMSNorm
+>>- Score: **0.0290526**
+>>- NDCG@10: **0.0220785**
+>>- HitRate@10: **0.0445758**
