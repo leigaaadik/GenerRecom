@@ -64,8 +64,9 @@ bash run.sh         # 开始训练
 
 ## 4️⃣ 按时间顺序的分支版本
 
-1. BaselineRMSNorm
-2. GenerativeFeatureSASRecRQVAE
+
+1. GenerativeFeatureSASRecRQVAE
+2. BaselineRMSNorm
 3. InfonceLossAddition
 4. **TripletLoss_And_ClipNorm**（最新）
 
