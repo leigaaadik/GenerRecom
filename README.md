@@ -43,17 +43,38 @@ bash run.sh         # 开始训练
 
 脚本会自动设置所有环境变量并调用 `main.py`；  
 
-更新内容以及分数
-> 基于上一版本**InfonceLossAddition**代码进行优化，引入clipnorm用于梯度裁剪。，加入tirpletLoss用于优化，设置整体损失计算方法为total_loss = w * loss_infonce + (1 - w) * loss_triplet，其中 w 由 --infonce_loss_weight 参数控制 (默认为0.95)
->>- Score: 0.0510698
->>- NDCG@10: 0.0395379
->>- HitRate@10: 0.0767374
+---
 
-按照时间顺序发布的分支版本依次如下（TripletLoss_And_ClipNorm为最新发布）
-  BaselineRMSNorm
-  GenerativeFeatureSASRecRQVAE
-  InfonceLossAddition
-* TripletLoss_And_ClipNorm
+## 3️⃣ 更新内容与性能指标
 
-版本发布方法：
-git checkout -b BranchName
+> 在上一版本 **InfonceLossAddition** 的基础上进行优化：
+> - 引入 `clipnorm` 做梯度裁剪
+> - 新增 `TripletLoss` 参与优化
+> - 损失函数改为  
+>   `total_loss = w * loss_infonce + (1 - w) * loss_triplet`  
+>   其中权重 `w` 由参数 `--infonce_loss_weight` 控制（默认 0.95）
+
+| 指标        | 数值      |
+|-------------|-----------|
+| Score       | 0.0510698 |
+| NDCG@10     | 0.0395379 |
+| HitRate@10  | 0.0767374 |
+
+---
+
+## 4️⃣ 按时间顺序的分支版本
+
+1. BaselineRMSNorm
+2. GenerativeFeatureSASRecRQVAE
+3. InfonceLossAddition
+4. **TripletLoss_And_ClipNorm**（最新）
+
+---
+
+## 5️⃣ 版本发布方法
+
+```bash
+git checkout -b <BranchName>
+git add <filename>
+git commit -m "<commit message>"
+git push origin <BranchName>
