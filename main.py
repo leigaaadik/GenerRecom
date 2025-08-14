@@ -22,7 +22,7 @@ def get_args():
     parser.add_argument('--lr', default=0.0005, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
     parser.add_argument('--warmup_steps', default=2000, type=int, help="Number of warmup steps for learning rate scheduler")
-    parser.add_argument('--num_epochs', default=5, type=int)
+    parser.add_argument('--num_epochs', default=10, type=int)
     parser.add_argument('--weight_decay', default=0.01, type=float, help="Weight decay for AdamW optimizer")
     
     parser.add_argument('--hidden_units', default=128, type=int)
@@ -37,6 +37,12 @@ def get_args():
     parser.add_argument('--norm_first', action='store_true')
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
     
+    parser.add_argument('--use_triplet_loss', default=True, action=argparse.BooleanOptionalAction, help="Enable Triplet Loss in addition to InfoNCE")
+    parser.add_argument('--triplet_loss_margin', default=1.0, type=float, help="Margin for the Triplet Loss")
+    parser.add_argument('--infonce_loss_weight', default=0.95, type=float, help="Weight for the InfoNCE loss component")
+
+    parser.add_argument('--clip_grad_norm', default=1.0, type=float, help="Max norm for gradient clipping, set to 0 to disable")
+
     args = parser.parse_args()
     return args
 
@@ -184,6 +190,10 @@ if __name__ == '__main__':
                 writer.add_scalar('Loss/train', loss.item(), global_step)
                 
                 loss.backward()
+
+                if args.clip_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad_norm)
+                
                 optimizer.step()
 
             current_lr = optimizer.param_groups[0]['lr']

@@ -22,7 +22,6 @@ def get_ckpt_path():
         if item.endswith(".pt"):
             return os.path.join(ckpt_path, item)
 
-
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -30,7 +29,7 @@ def get_args():
     parser.add_argument('--lr', default=0.0005, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
     parser.add_argument('--warmup_steps', default=2000, type=int, help="Number of warmup steps for learning rate scheduler")
-    parser.add_argument('--num_epochs', default=5, type=int)
+    parser.add_argument('--num_epochs', default=10, type=int)
     parser.add_argument('--weight_decay', default=0.01, type=float, help="Weight decay for AdamW optimizer")
     
     parser.add_argument('--hidden_units', default=128, type=int)
@@ -45,9 +44,14 @@ def get_args():
     parser.add_argument('--norm_first', action='store_true')
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
     
+    parser.add_argument('--use_triplet_loss', default=True, action=argparse.BooleanOptionalAction, help="Enable Triplet Loss in addition to InfoNCE")
+    parser.add_argument('--triplet_loss_margin', default=1.0, type=float, help="Margin for the Triplet Loss")
+    parser.add_argument('--infonce_loss_weight', default=0.95, type=float, help="Weight for the InfoNCE loss component")
+
+    parser.add_argument('--clip_grad_norm', default=1.0, type=float, help="Max norm for gradient clipping, set to 0 to disable")
+
     args = parser.parse_args()
     return args
-
 
 def read_result_ids(file_path):
     with open(file_path, 'rb') as f:
@@ -57,7 +61,6 @@ def read_result_ids(file_path):
         num_result_ids = num_points_query * query_ann_top_k
         result_ids = np.fromfile(f, dtype=np.uint64, count=num_result_ids)
         return result_ids.reshape((num_points_query, query_ann_top_k))
-
 
 def process_cold_start_feat(feat):
     processed_feat = {}
@@ -72,7 +75,6 @@ def process_cold_start_feat(feat):
         else: processed_feat[feat_id] = feat_value
     return processed_feat
 
-# ==================== NEW HELPER FUNCTION START ====================
 def read_fbin(file_path):
     with open(file_path, 'rb') as f:
         num_points = struct.unpack('I', f.read(4))[0]
@@ -80,8 +82,6 @@ def read_fbin(file_path):
         num_elements = num_points * num_dimensions
         data = np.fromfile(f, dtype=np.float32, count=num_elements)
         return data.reshape((num_points, num_dimensions))
-# ===================== NEW HELPER FUNCTION END =====================
-
 
 def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, model):
     EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
@@ -112,27 +112,21 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
             creative_ids.append(creative_id)
             retrieval_ids.append(retrieval_id)
             features.append(feature)
+            
             retrieve_id2creative_id[retrieval_id] = creative_id
     
-    # ==================== MODIFICATION START ====================
-    # Step 1: Call the original function, which saves UNNORMALIZED embeddings to file.
     model.save_item_emb(item_ids, retrieval_ids, features, os.environ.get('EVAL_RESULT_PATH'))
 
-    # Step 2: Read the unnormalized embeddings back from the file.
     embedding_file_path = Path(os.environ.get("EVAL_RESULT_PATH"), "embedding.fbin")
     unnormalized_embs = read_fbin(embedding_file_path)
 
-    # Step 3: Perform L2 normalization.
     normalized_embs = F.normalize(torch.from_numpy(unnormalized_embs), p=2, dim=1).numpy()
     
-    # Step 4: Overwrite the original file with the NORMALIZED embeddings.
     save_emb(normalized_embs, embedding_file_path)
-    # ===================== MODIFICATION END =====================
     
     with open(Path(os.environ.get('EVAL_RESULT_PATH'), "retrive_id2creative_id.json"), "w") as f:
         json.dump(retrieve_id2creative_id, f)
     return retrieve_id2creative_id
-
 
 def infer():
     args = get_args()
@@ -186,6 +180,7 @@ def infer():
         + str(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
         + " --query_ann_top_k=10 --faiss_M=64 --faiss_ef_construction=1280 --query_ef_search=640 --faiss_metric_type=0"
     )
+
     os.system(ann_cmd)
 
     top10s_retrieved = read_result_ids(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))

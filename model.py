@@ -1,5 +1,3 @@
-# model.py
-
 from pathlib import Path
 
 import numpy as np
@@ -83,6 +81,12 @@ class BaselineModel(torch.nn.Module):
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
         self.temp = 0.07
+        # ==================== MODIFICATION START ====================
+        self.use_triplet_loss = args.use_triplet_loss
+        self.infonce_loss_weight = args.infonce_loss_weight
+        if self.use_triplet_loss:
+            self.triplet_loss_fn = nn.TripletMarginLoss(margin=args.triplet_loss_margin, p=2)
+        # ===================== MODIFICATION END =====================
 
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
@@ -248,26 +252,36 @@ class BaselineModel(torch.nn.Module):
     def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask):
         hidden_size = neg_embs.size(-1)
         
-        seq_embs = seq_embs / seq_embs.norm(dim=-1, keepdim=True)
-        pos_embs = pos_embs / pos_embs.norm(dim=-1, keepdim=True)
-        neg_embs = neg_embs / neg_embs.norm(dim=-1, keepdim=True)
+        seq_embs_norm = seq_embs / seq_embs.norm(dim=-1, keepdim=True)
+        pos_embs_norm = pos_embs / pos_embs.norm(dim=-1, keepdim=True)
+        neg_embs_norm = neg_embs / neg_embs.norm(dim=-1, keepdim=True)
 
-        pos_logits = F.cosine_similarity(seq_embs, pos_embs, dim=-1).unsqueeze(-1)
+        pos_logits = F.cosine_similarity(seq_embs_norm, pos_embs_norm, dim=-1).unsqueeze(-1)
         
-        neg_embedding_all = neg_embs.reshape(-1, hidden_size)
-        neg_logits = torch.matmul(seq_embs, neg_embedding_all.transpose(-1, -2))
+        neg_embedding_all = neg_embs_norm.reshape(-1, hidden_size)
+        neg_logits = torch.matmul(seq_embs_norm, neg_embedding_all.transpose(-1, -2))
         
         logits = torch.cat([pos_logits, neg_logits], dim=-1)
         
         logits = logits[loss_mask.bool()] / self.temp
         
         if logits.size(0) == 0:
-            return torch.tensor(0.0, device=self.dev, requires_grad=True)
+            return torch.tensor(0.0, device=self.dev)
 
         labels = torch.zeros(logits.size(0), device=logits.device, dtype=torch.int64)
         
         loss = F.cross_entropy(logits, labels)
         return loss
+
+    def compute_triplet_loss(self, seq_embs, pos_embs, neg_embs, loss_mask):
+        anchor = seq_embs[loss_mask]
+        positive = pos_embs[loss_mask]
+        negative = neg_embs[loss_mask]
+
+        if anchor.size(0) == 0:
+            return torch.tensor(0.0, device=self.dev)
+            
+        return self.triplet_loss_fn(anchor, positive, negative)
 
     def forward(self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature):
         loss_mask = (next_mask == 1)
@@ -278,8 +292,15 @@ class BaselineModel(torch.nn.Module):
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
         
-        loss = self.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask)
-        return loss
+        infonce_loss = self.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask)
+        
+        total_loss = infonce_loss
+        if self.use_triplet_loss:
+            triplet_loss = self.compute_triplet_loss(log_feats, pos_embs, neg_embs, loss_mask)
+            w_infonce = self.infonce_loss_weight
+            total_loss = w_infonce * infonce_loss + (1 - w_infonce) * triplet_loss
+            
+        return total_loss
 
     def predict(self, log_seqs, seq_feature, mask):
         log_feats = self.log2feats(log_seqs, mask, seq_feature)
