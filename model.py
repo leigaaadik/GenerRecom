@@ -1,54 +1,36 @@
+# model.py
+
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn # Import nn for easier access
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
 from dataset import save_emb
 
-# --- ADDED: RMSNorm Implementation ---
 class RMSNorm(nn.Module):
-    """
-    Root Mean Square Layer Normalization.
-
-    Args:
-        hidden_size (int): The dimension of the hidden state.
-        eps (float): A small value added to the denominator for numerical stability. Default: 1e-6.
-    """
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
-        # 'weight' is the learnable scaling parameter 'g' in the RMSNorm paper
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
-        # For numerical stability, perform calculations in float32
         hidden_states = hidden_states.to(torch.float32)
-        
-        # Calculate the mean of squares
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        
-        # Normalize the hidden states
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        
-        # Scale by the learnable weight and cast back to the original dtype
         return (self.weight * hidden_states).to(input_dtype)
-
 
 class FlashMultiHeadAttention(torch.nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
         super(FlashMultiHeadAttention, self).__init__()
-
         self.hidden_units = hidden_units
         self.num_heads = num_heads
         self.head_dim = hidden_units // num_heads
         self.dropout_rate = dropout_rate
-
         assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
-
         self.q_linear = torch.nn.Linear(hidden_units, hidden_units)
         self.k_linear = torch.nn.Linear(hidden_units, hidden_units)
         self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
@@ -56,15 +38,12 @@ class FlashMultiHeadAttention(torch.nn.Module):
 
     def forward(self, query, key, value, attn_mask=None):
         batch_size, seq_len, _ = query.size()
-
         Q = self.q_linear(query)
         K = self.k_linear(key)
         V = self.v_linear(value)
-
         Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-
         if hasattr(F, 'scaled_dot_product_attention'):
             attn_output = F.scaled_dot_product_attention(
                 Q, K, V, dropout_p=self.dropout_rate if self.training else 0.0, attn_mask=attn_mask.unsqueeze(1)
@@ -77,11 +56,9 @@ class FlashMultiHeadAttention(torch.nn.Module):
             attn_weights = F.softmax(scores, dim=-1)
             attn_weights = F.dropout(attn_weights, p=self.dropout_rate, training=self.training)
             attn_output = torch.matmul(attn_weights, V)
-
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
         output = self.out_linear(attn_output)
         return output, None
-
 
 class PointWiseFeedForward(torch.nn.Module):
     def __init__(self, hidden_units, dropout_rate):
@@ -97,16 +74,15 @@ class PointWiseFeedForward(torch.nn.Module):
         outputs = outputs.transpose(-1, -2)
         return outputs
 
-
 class BaselineModel(torch.nn.Module):
     def __init__(self, user_num, item_num, feat_statistics, feat_types, args):
         super(BaselineModel, self).__init__()
-
         self.user_num = user_num
         self.item_num = item_num
         self.dev = args.device
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
+        self.temp = 0.07
 
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
@@ -114,14 +90,11 @@ class BaselineModel(torch.nn.Module):
         self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
         self.sparse_emb = torch.nn.ModuleDict()
         self.emb_transform = torch.nn.ModuleDict()
-
         self.attention_layernorms = torch.nn.ModuleList()
         self.attention_layers = torch.nn.ModuleList()
         self.forward_layernorms = torch.nn.ModuleList()
         self.forward_layers = torch.nn.ModuleList()
-
         self._init_feat_info(feat_statistics, feat_types)
-
         userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
             self.USER_CONTINUAL_FEAT
         )
@@ -130,30 +103,20 @@ class BaselineModel(torch.nn.Module):
             + len(self.ITEM_CONTINUAL_FEAT)
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
-
         self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
         self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
-
-        # --- MODIFICATION: Replaced LayerNorm with RMSNorm ---
         self.last_layernorm = RMSNorm(args.hidden_units, eps=1e-6)
-
         for _ in range(args.num_blocks):
-            # --- MODIFICATION: Replaced LayerNorm with RMSNorm ---
             new_attn_layernorm = RMSNorm(args.hidden_units, eps=1e-6)
             self.attention_layernorms.append(new_attn_layernorm)
-
             new_attn_layer = FlashMultiHeadAttention(
                 args.hidden_units, args.num_heads, args.dropout_rate
             )
             self.attention_layers.append(new_attn_layer)
-
-            # --- MODIFICATION: Replaced LayerNorm with RMSNorm ---
             new_fwd_layernorm = RMSNorm(args.hidden_units, eps=1e-6)
             self.forward_layernorms.append(new_fwd_layernorm)
-
             new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
             self.forward_layers.append(new_fwd_layer)
-
         for k in self.USER_SPARSE_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_SPARSE_FEAT:
@@ -211,7 +174,6 @@ class BaselineModel(torch.nn.Module):
         else:
             item_embedding = self.item_emb(seq)
             item_feat_list = [item_embedding]
-
         all_feat_types = [
             (self.ITEM_SPARSE_FEAT, 'item_sparse', item_feat_list),
             (self.ITEM_ARRAY_FEAT, 'item_array', item_feat_list),
@@ -225,7 +187,6 @@ class BaselineModel(torch.nn.Module):
                     (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list),
                 ]
             )
-
         for feat_dict, feat_type, feat_list in all_feat_types:
             if not feat_dict: continue
             for k in feat_dict:
@@ -236,7 +197,6 @@ class BaselineModel(torch.nn.Module):
                     feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
                 elif feat_type.endswith('continual'):
                     feat_list.append(tensor_feature.unsqueeze(2))
-
         for k in self.ITEM_EMB_FEAT:
             batch_size = len(feature_array)
             emb_dim = self.ITEM_EMB_FEAT[k]
@@ -248,7 +208,6 @@ class BaselineModel(torch.nn.Module):
                         batch_emb_data[i, j] = item[k]
             tensor_feature = torch.from_numpy(batch_emb_data).to(self.dev)
             item_feat_list.append(self.emb_transform[k](tensor_feature))
-
         all_item_emb = torch.cat(item_feat_list, dim=2)
         all_item_emb = torch.relu(self.itemdnn(all_item_emb))
         if include_user:
@@ -268,13 +227,11 @@ class BaselineModel(torch.nn.Module):
         poss *= log_seqs != 0
         seqs += self.pos_emb(poss)
         seqs = self.emb_dropout(seqs)
-
         maxlen = seqs.shape[1]
         ones_matrix = torch.ones((maxlen, maxlen), dtype=torch.bool, device=self.dev)
         attention_mask_tril = torch.tril(ones_matrix)
         attention_mask_pad = (mask != 0).to(self.dev)
         attention_mask = attention_mask_tril.unsqueeze(0) & attention_mask_pad.unsqueeze(1)
-
         for i in range(len(self.attention_layers)):
             if self.norm_first:
                 x = self.attention_layernorms[i](seqs)
@@ -285,23 +242,44 @@ class BaselineModel(torch.nn.Module):
                 mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
                 seqs = self.attention_layernorms[i](seqs + mha_outputs)
                 seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
-
         log_feats = self.last_layernorm(seqs)
         return log_feats
 
-    def forward(self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature):
-        log_feats = self.log2feats(user_item, mask, seq_feature)
-        loss_mask = (next_mask == 1).to(self.dev)
+    def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask):
+        hidden_size = neg_embs.size(-1)
+        
+        seq_embs = seq_embs / seq_embs.norm(dim=-1, keepdim=True)
+        pos_embs = pos_embs / pos_embs.norm(dim=-1, keepdim=True)
+        neg_embs = neg_embs / neg_embs.norm(dim=-1, keepdim=True)
 
+        pos_logits = F.cosine_similarity(seq_embs, pos_embs, dim=-1).unsqueeze(-1)
+        
+        neg_embedding_all = neg_embs.reshape(-1, hidden_size)
+        neg_logits = torch.matmul(seq_embs, neg_embedding_all.transpose(-1, -2))
+        
+        logits = torch.cat([pos_logits, neg_logits], dim=-1)
+        
+        logits = logits[loss_mask.bool()] / self.temp
+        
+        if logits.size(0) == 0:
+            return torch.tensor(0.0, device=self.dev, requires_grad=True)
+
+        labels = torch.zeros(logits.size(0), device=logits.device, dtype=torch.int64)
+        
+        loss = F.cross_entropy(logits, labels)
+        return loss
+
+    def forward(self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature):
+        loss_mask = (next_mask == 1)
+        if not loss_mask.any():
+            return torch.tensor(0.0, device=self.dev, requires_grad=True)
+
+        log_feats = self.log2feats(user_item, mask, seq_feature)
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
-
-        pos_logits = (log_feats * pos_embs).sum(dim=-1)
-        neg_logits = (log_feats * neg_embs).sum(dim=-1)
-        pos_logits = pos_logits * loss_mask
-        neg_logits = neg_logits * loss_mask
-
-        return pos_logits, neg_logits
+        
+        loss = self.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask)
+        return loss
 
     def predict(self, log_seqs, seq_feature, mask):
         log_feats = self.log2feats(log_seqs, mask, seq_feature)
@@ -319,7 +297,6 @@ class BaselineModel(torch.nn.Module):
             batch_feat = np.array(batch_feat, dtype=object)
             batch_emb = self.feat2emb(item_seq, [batch_feat], include_user=False).squeeze(0)
             all_embs.append(batch_emb.detach().cpu().numpy().astype(np.float32))
-
         final_ids = np.array(retrieval_ids, dtype=np.uint64).reshape(-1, 1)
         final_embs = np.concatenate(all_embs, axis=0)
         save_emb(final_embs, Path(save_path, 'embedding.fbin'))

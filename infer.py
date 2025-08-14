@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -25,28 +26,26 @@ def get_ckpt_path():
 def get_args():
     parser = argparse.ArgumentParser()
 
-    # Train params
     parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--lr', default=0.0005, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
-
-    # Baseline Model construction (Modified Size)
-    parser.add_argument('--hidden_units', default=128, type=int)  # Changed from 256 to 128
-    parser.add_argument('--num_blocks', default=6, type=int)
-    parser.add_argument('--num_epochs', default=10, type=int)
-    parser.add_argument('--num_heads', default=4, type=int)       # Changed from 8 to 4
+    parser.add_argument('--warmup_steps', default=2000, type=int, help="Number of warmup steps for learning rate scheduler")
+    parser.add_argument('--num_epochs', default=5, type=int)
+    parser.add_argument('--weight_decay', default=0.01, type=float, help="Weight decay for AdamW optimizer")
+    
+    parser.add_argument('--hidden_units', default=128, type=int)
+    parser.add_argument('--num_blocks', default=4, type=int)
+    parser.add_argument('--num_heads', default=4, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
+    
     parser.add_argument('--l2_emb', default=0.0, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
     parser.add_argument('--norm_first', action='store_true')
-
-    # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
-
+    
     args = parser.parse_args()
-
     return args
 
 
@@ -72,6 +71,16 @@ def process_cold_start_feat(feat):
         elif type(feat_value) == str: processed_feat[feat_id] = 0
         else: processed_feat[feat_id] = feat_value
     return processed_feat
+
+# ==================== NEW HELPER FUNCTION START ====================
+def read_fbin(file_path):
+    with open(file_path, 'rb') as f:
+        num_points = struct.unpack('I', f.read(4))[0]
+        num_dimensions = struct.unpack('I', f.read(4))[0]
+        num_elements = num_points * num_dimensions
+        data = np.fromfile(f, dtype=np.float32, count=num_elements)
+        return data.reshape((num_points, num_dimensions))
+# ===================== NEW HELPER FUNCTION END =====================
 
 
 def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, model):
@@ -104,8 +113,22 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
             retrieval_ids.append(retrieval_id)
             features.append(feature)
             retrieve_id2creative_id[retrieval_id] = creative_id
-
+    
+    # ==================== MODIFICATION START ====================
+    # Step 1: Call the original function, which saves UNNORMALIZED embeddings to file.
     model.save_item_emb(item_ids, retrieval_ids, features, os.environ.get('EVAL_RESULT_PATH'))
+
+    # Step 2: Read the unnormalized embeddings back from the file.
+    embedding_file_path = Path(os.environ.get("EVAL_RESULT_PATH"), "embedding.fbin")
+    unnormalized_embs = read_fbin(embedding_file_path)
+
+    # Step 3: Perform L2 normalization.
+    normalized_embs = F.normalize(torch.from_numpy(unnormalized_embs), p=2, dim=1).numpy()
+    
+    # Step 4: Overwrite the original file with the NORMALIZED embeddings.
+    save_emb(normalized_embs, embedding_file_path)
+    # ===================== MODIFICATION END =====================
+    
     with open(Path(os.environ.get('EVAL_RESULT_PATH'), "retrive_id2creative_id.json"), "w") as f:
         json.dump(retrieve_id2creative_id, f)
     return retrieve_id2creative_id
@@ -125,14 +148,19 @@ def infer():
 
     ckpt_path = get_ckpt_path()
     model.load_state_dict(torch.load(ckpt_path, map_location=torch.device(args.device)))
+    
     all_embs = []
     user_list = []
     with torch.no_grad():
         for step, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
             seq, token_type, seq_feat, user_id = batch
             seq = seq.to(args.device)
-            logits = model.predict(seq, seq_feat, token_type)
-            all_embs.append(logits.detach().cpu().numpy().astype(np.float32))
+            
+            unnormalized_logits = model.predict(seq, seq_feat, token_type)
+            
+            normalized_logits = F.normalize(unnormalized_logits, p=2, dim=-1)
+            
+            all_embs.append(normalized_logits.detach().cpu().numpy().astype(np.float32))
             user_list.extend(user_id)
 
     retrieve_id2creative_id = get_candidate_emb(
@@ -142,6 +170,7 @@ def infer():
         test_dataset.mm_emb_dict,
         model,
     )
+    
     all_embs = np.concatenate(all_embs, axis=0)
     save_emb(all_embs, Path(os.environ.get('EVAL_RESULT_PATH'), 'query.fbin'))
     

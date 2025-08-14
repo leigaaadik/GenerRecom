@@ -42,8 +42,3 @@ bash run.sh         # 开始训练
 ```
 
 脚本会自动设置所有环境变量并调用 `main.py`；  
-
->- scale up + warm up + weight decay + AdamW + RMSNorm
->>- Score: **0.0290526**
->>- NDCG@10: **0.0220785**
->>- HitRate@10: **0.0445758**
