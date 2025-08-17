@@ -47,18 +47,29 @@ bash run.sh         # 开始训练
 
 ## 3️⃣ 更新内容与性能指标
 
-> 在上一版本 **InfonceLossAddition** 的基础上进行优化：
-> - 引入 `clipnorm` 做梯度裁剪
-> - 新增 `TripletLoss` 参与优化
-> - 损失函数改为  
->   `total_loss = w * loss_infonce + (1 - w) * loss_triplet`  
->   其中权重 `w` 由参数 `--infonce_loss_weight` 控制（默认 0.95）
+> 在上一版本 **TripletLoss_And_ClipNorm** 的基础上进行优化：
+> - 删除TripletLoss，仅保留InfonceLoss作为损失函数
+> - 修改模型架构，序列架构替换为HSTU
+> - 修改原HSTU中的绝对位置编码改为利用timestamp进行RoPE旋转位置编码，修改归一化方法LayerNorm->RMSNorm
+> - 学习率改为改为预热warm up+线性衰减weight deacy
+> - 修改dataset.py从数据中读出timestamp特征
+> - 修改代码框架，可视化正负样本相似度以及区分度
 
-| 指标        | 数值      |
+> 表格中记录了训练产出的第3个epoch和第4个epoch模型的评测结果，说明模型仍在收敛，可以通过增加训练epoch数提升得分
+
+> 训练时长约1h30min/epoch
+
+| 指标(epoch4)| 数值      |
 |-------------|-----------|
-| Score       | 0.0510698 |
-| NDCG@10     | 0.0395379 |
-| HitRate@10  | 0.0767374 |
+| Score       | 0.0555635 |
+| NDCG@10     | 0.0431958 |
+| HitRate@10  | 0.0830917 |
+
+| 指标(epoch3)| 数值      |
+|-------------|-----------|
+| Score       | 0.0537773 |
+| NDCG@10     | 0.0418228 |
+| HitRate@10  | 0.0803857 |
 
 ---
 
@@ -68,7 +79,8 @@ bash run.sh         # 开始训练
 1. GenerativeFeatureSASRecRQVAE
 2. BaselineRMSNorm
 3. InfonceLossAddition
-4. **TripletLoss_And_ClipNorm**（最新）
+4. TripletLoss_And_ClipNorm
+5. **HSTU**（最新）
 
 ---
 
