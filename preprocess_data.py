@@ -4,6 +4,8 @@ from pathlib import Path
 from tqdm import tqdm
 import os
 import numpy as np
+import re
+import shutil
 
 def merge_and_index_sequences(data_dir):
     """
@@ -13,14 +15,8 @@ def merge_and_index_sequences(data_dir):
     print("--- 步骤 1: 开始处理用户序列数据 ---")
     data_path = Path(data_dir)
     
-    # 根据您的文件结构，part文件似乎分散在多个子目录中。
-    # 我们需要找到包含用户序列的part文件。假设它们直接在主数据目录下或特定子目录。
-    # 为了避免混淆嵌入文件的part文件，我们假设序列文件不包含 'emb' 在路径中。
-    # !! 如果您的序列part文件在特定文件夹，请修改这里的glob模式 !!
-    # 例如：part_files = sorted(list(data_path.glob("raw_sequences/part-*")))
     all_part_files = sorted(list(data_path.glob("**/part-*")))
     
-    # 过滤掉属于creative_emb的part文件和_SUCCESS文件
     seq_part_files = [
         f for f in all_part_files 
         if 'creative_emb' not in str(f) and not f.name.endswith('_SUCCESS')
@@ -58,8 +54,9 @@ def merge_and_index_sequences(data_dir):
 
 def preprocess_embeddings(data_dir):
     """
-    遍历 creative_emb 目录，将每个 emb_XX_YY/part-* 目录下的JSON行
-    合并成一个单一的 emb_XX_YY.pkl 文件。
+    遍历 creative_emb 目录，根据 dataset.py 的加载逻辑生成目标文件。
+    - 对于 emb_81_32，合并 part-* 文件到一个 .pkl 文件。
+    - 对于其他 emb_XX_YY 目录，合并 part-* 文件到一个 .json 文件。
     """
     print("\n--- 步骤 2: 开始处理多模态嵌入数据 ---")
     creative_emb_path = Path(data_dir) / 'creative_emb'
@@ -68,58 +65,81 @@ def preprocess_embeddings(data_dir):
         print(f"错误：找不到嵌入目录 {creative_emb_path}。")
         return
 
-    # 遍历 creative_emb 下的所有子目录，例如 emb_81_32, emb_82_1024 ...
+    pattern = re.compile(r'emb_(\d+)_.*')
+
     for emb_dir in creative_emb_path.iterdir():
-        if emb_dir.is_dir() and emb_dir.name.startswith('emb_'):
-            print(f"\n正在处理嵌入类型: {emb_dir.name}")
+        if not emb_dir.is_dir() or not emb_dir.name.startswith('emb_'):
+            continue
+
+        match = pattern.match(emb_dir.name)
+        if not match:
+            print(f"警告：无法从目录名 {emb_dir.name} 中解析特征ID，跳过。")
+            continue
             
-            part_files = sorted(list(emb_dir.glob("part-*")))
-            part_files = [f for f in part_files if not f.name.endswith('_SUCCESS')]
+        feat_id = match.group(1)
+        print(f"\n正在处理嵌入类型: {emb_dir.name} (ID: {feat_id})")
+        
+        part_files = sorted(list(emb_dir.glob("part-*")))
+        part_files = [f for f in part_files if not f.name.endswith('_SUCCESS')]
 
-            if not part_files:
-                print(f"  -> 在 {emb_dir} 中找不到 part 文件，跳过。")
-                continue
+        if not part_files:
+            print(f"  -> 在 {emb_dir} 中找不到 part 文件，跳过。")
+            continue
 
-            # 这是我们将要构建的字典，key是物品ID，value是嵌入向量
+        # ==================== MODIFICATION START ====================
+        if feat_id == '81':
+            # --- 逻辑 1: 处理81号特征，合并为 .pkl ---
             embedding_data = {}
-            
-            for part_file in tqdm(part_files, desc=f"  -> 读取 {emb_dir.name}"):
+            for part_file in tqdm(part_files, desc=f"  -> 读取并合并为 .pkl"):
                 with open(part_file, 'r', encoding='utf-8') as f_in:
                     for line in f_in:
                         try:
                             data_dict = json.loads(line.strip())
-                            # 键可能是 'anonymous_cid' 或其他，我们取第一个非'emb'的键
-                            key_id = next(k for k, v in data_dict.items() if k != 'emb')
-                            
+                            key_id = data_dict['anonymous_cid']
                             emb_vector = data_dict['emb']
-                            
-                            # 转换为Numpy数组以获得更好的性能和兼容性
                             if isinstance(emb_vector, list):
                                 emb_vector = np.array(emb_vector, dtype=np.float32)
-                            
-                            embedding_data[data_dict[key_id]] = emb_vector
-                        except (json.JSONDecodeError, StopIteration, KeyError) as e:
+                            embedding_data[key_id] = emb_vector
+                        except (json.JSONDecodeError, KeyError) as e:
                             print(f"    警告：在文件 {part_file} 中解析行失败: {line.strip()}. 错误: {e}")
             
-            # 定义输出的 .pkl 文件路径
-            # 输出文件将位于 creative_emb 目录下，名为 emb_81_32.pkl
             output_pkl_path = creative_emb_path / f"{emb_dir.name}.pkl"
-
             with open(output_pkl_path, 'wb') as f_out:
                 pickle.dump(embedding_data, f_out)
             
-            print(f"  -> 成功创建嵌入文件: {output_pkl_path}，包含 {len(embedding_data)} 个条目。")
+            print(f"  -> 成功创建 .pkl 文件: {output_pkl_path}，包含 {len(embedding_data)} 个条目。")
+        
+        else: # (feat_id is '82', '83', etc.)
+            # --- 逻辑 2: 处理其他特征，合并为单一的 .json 文件 ---
+            # dataset.py期望在子目录中找到.json文件，我们将所有part合并成一个，简化结构
+            output_json_path = emb_dir / 'part-00000.json'
+            
+            # 备份原始文件
+            backup_dir = emb_dir.parent / f"{emb_dir.name}_backup"
+            if not backup_dir.exists():
+                shutil.move(emb_dir, backup_dir)
+                emb_dir.mkdir()
+                print(f"  -> 已将原始part文件备份到: {backup_dir}")
+
+            print(f"  -> 开始合并part文件到: {output_json_path}")
+            with open(output_json_path, 'w', encoding='utf-8') as f_out:
+                for part_file in tqdm(backup_dir.glob("part-*"), desc=f"  -> 合并为 .json"):
+                    if part_file.name.endswith('_SUCCESS'): continue
+                    with open(part_file, 'r', encoding='utf-8') as f_in:
+                        for line in f_in:
+                            f_out.write(line) # 直接写入原始的JSON行
+            
+            print(f"  -> 成功创建 .json 文件: {output_json_path}")
+
+        # ===================== MODIFICATION END =====================
 
 if __name__ == '__main__':
-    # --- 请在这里配置您的数据目录 ---
-    # 这个路径应该指向包含 creative_emb, indexer.pkl 等文件的目录
     DATA_DIRECTORY = 'TencentGR_1k'
     
     if not Path(DATA_DIRECTORY).exists():
         print(f"错误：数据目录 '{DATA_DIRECTORY}' 不存在。请检查路径配置。")
     else:
-        # 依次执行两个预处理步骤
         merge_and_index_sequences(DATA_DIRECTORY)
         preprocess_embeddings(DATA_DIRECTORY)
         
-        print("\n\n✅  所有预处理已完成！现在项目可以正常运行。")
+        print("\n\n✅  所有预处理已完成！数据格式现在与代码框架完全匹配。")

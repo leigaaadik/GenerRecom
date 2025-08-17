@@ -46,7 +46,7 @@ def get_args():
     
     parser.add_argument('--use_triplet_loss', default=True, action=argparse.BooleanOptionalAction, help="Enable Triplet Loss in addition to InfoNCE")
     parser.add_argument('--triplet_loss_margin', default=1.0, type=float, help="Margin for the Triplet Loss")
-    parser.add_argument('--infonce_loss_weight', default=0.95, type=float, help="Weight for the InfoNCE loss component")
+    parser.add_argument('--infonce_loss_weight', default=1.0, type=float, help="Weight for the InfoNCE loss component")
 
     parser.add_argument('--clip_grad_norm', default=1.0, type=float, help="Max norm for gradient clipping, set to 0 to disable")
 
@@ -147,10 +147,11 @@ def infer():
     user_list = []
     with torch.no_grad():
         for step, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
-            seq, token_type, seq_feat, user_id = batch
-            seq = seq.to(args.device)
+            seq, token_type, seq_feat, user_id, seq_ts = batch
+            seq, token_type, seq_ts = seq.to(args.device), token_type.to(args.device), seq_ts.to(args.device)
             
-            unnormalized_logits = model.predict(seq, seq_feat, token_type)
+            with torch.amp.autocast(device_type=args.device):
+                unnormalized_logits = model.predict(seq, seq_feat, token_type, seq_ts)
             
             normalized_logits = F.normalize(unnormalized_logits, p=2, dim=-1)
             

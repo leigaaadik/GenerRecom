@@ -21,56 +21,92 @@ class RMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return (self.weight * hidden_states).to(input_dtype)
 
-class FlashMultiHeadAttention(torch.nn.Module):
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, base=10000, device=None):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32).to(device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, position_ids, time_deltas, seq_len):
+        
+        combined_pos = position_ids.float() + torch.log(time_deltas.float() + 1.0) * 0.1
+
+        freqs = torch.outer(combined_pos.flatten(), self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        cos = emb.cos().view(position_ids.shape[0], seq_len, self.dim)
+        sin = emb.sin().view(position_ids.shape[0], seq_len, self.dim)
+        return cos, sin
+
+class HSTULayer(nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
-        super(FlashMultiHeadAttention, self).__init__()
+        super().__init__()
+        assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
         self.hidden_units = hidden_units
         self.num_heads = num_heads
         self.head_dim = hidden_units // num_heads
         self.dropout_rate = dropout_rate
-        assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
-        self.q_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.k_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
 
-    def forward(self, query, key, value, attn_mask=None):
-        batch_size, seq_len, _ = query.size()
-        Q = self.q_linear(query)
-        K = self.k_linear(key)
-        V = self.v_linear(value)
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        if hasattr(F, 'scaled_dot_product_attention'):
-            attn_output = F.scaled_dot_product_attention(
-                Q, K, V, dropout_p=self.dropout_rate if self.training else 0.0, attn_mask=attn_mask.unsqueeze(1)
-            )
-        else:
-            scale = (self.head_dim) ** -0.5
-            scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
-            if attn_mask is not None:
-                scores.masked_fill_(attn_mask.unsqueeze(1).logical_not(), float('-inf'))
-            attn_weights = F.softmax(scores, dim=-1)
-            attn_weights = F.dropout(attn_weights, p=self.dropout_rate, training=self.training)
-            attn_output = torch.matmul(attn_weights, V)
+        self.uvqk_proj = nn.Linear(hidden_units, 2 * hidden_units + 2 * hidden_units)
+        self.gating_norm = RMSNorm(hidden_units)
+        self.output_proj = nn.Linear(hidden_units, hidden_units)
+        self.output_dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x, cos, sin, attn_mask=None):
+        batch_size, seq_len, _ = x.shape
+        residual = x
+        
+        uvqk = self.uvqk_proj(x)
+        u, v, q, k = torch.split(
+            uvqk,
+            [self.hidden_units, self.hidden_units, self.hidden_units, self.hidden_units],
+            dim=-1,
+        )
+        
+        u = F.silu(u)
+
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        cos = cos.unsqueeze(2).repeat(1, 1, self.num_heads, 1)
+        sin = sin.unsqueeze(2).repeat(1, 1, self.num_heads, 1)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim**0.5)
+
+        attn_weights = F.silu(scores)
+        
+        if attn_mask is not None:
+            attn_weights = attn_weights * attn_mask.unsqueeze(1)
+            
+        attn_output = torch.matmul(attn_weights, v)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_units)
-        output = self.out_linear(attn_output)
-        return output, None
-
-class PointWiseFeedForward(torch.nn.Module):
-    def __init__(self, hidden_units, dropout_rate):
-        super(PointWiseFeedForward, self).__init__()
-        self.conv1 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
-        self.dropout1 = torch.nn.Dropout(p=dropout_rate)
-        self.relu = torch.nn.ReLU()
-        self.conv2 = torch.nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
-        self.dropout2 = torch.nn.Dropout(p=dropout_rate)
-
-    def forward(self, inputs):
-        outputs = self.dropout2(self.conv2(self.relu(self.dropout1(self.conv1(inputs.transpose(-1, -2))))))
-        outputs = outputs.transpose(-1, -2)
-        return outputs
+        
+        normed_attn_output = self.gating_norm(attn_output)
+        gated_output = normed_attn_output * u
+        
+        transformed_output = self.output_proj(gated_output)
+        transformed_output = self.output_dropout(transformed_output)
+        
+        output = residual + transformed_output
+        return output
 
 class BaselineModel(torch.nn.Module):
     def __init__(self, user_num, item_num, feat_statistics, feat_types, args):
@@ -78,26 +114,18 @@ class BaselineModel(torch.nn.Module):
         self.user_num = user_num
         self.item_num = item_num
         self.dev = args.device
-        self.norm_first = args.norm_first
         self.maxlen = args.maxlen
+        self.num_heads = args.num_heads
         self.temp = 0.07
-        # ==================== MODIFICATION START ====================
-        self.use_triplet_loss = args.use_triplet_loss
-        self.infonce_loss_weight = args.infonce_loss_weight
-        if self.use_triplet_loss:
-            self.triplet_loss_fn = nn.TripletMarginLoss(margin=args.triplet_loss_margin, p=2)
-        # ===================== MODIFICATION END =====================
-
+        
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
-        self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
+        
+        self.rotary_emb = RotaryEmbedding(dim=args.hidden_units // args.num_heads, device=self.dev)
+        
         self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
         self.sparse_emb = torch.nn.ModuleDict()
         self.emb_transform = torch.nn.ModuleDict()
-        self.attention_layernorms = torch.nn.ModuleList()
-        self.attention_layers = torch.nn.ModuleList()
-        self.forward_layernorms = torch.nn.ModuleList()
-        self.forward_layers = torch.nn.ModuleList()
         self._init_feat_info(feat_statistics, feat_types)
         userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
             self.USER_CONTINUAL_FEAT
@@ -109,18 +137,13 @@ class BaselineModel(torch.nn.Module):
         )
         self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
         self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
+        self.feat_fusion_norm = RMSNorm(args.hidden_units)
+        self.input_norm = RMSNorm(args.hidden_units)
+
+        self.hstu_layers = nn.ModuleList(
+            [HSTULayer(args.hidden_units, args.num_heads, args.dropout_rate) for _ in range(args.num_blocks)]
+        )
         self.last_layernorm = RMSNorm(args.hidden_units, eps=1e-6)
-        for _ in range(args.num_blocks):
-            new_attn_layernorm = RMSNorm(args.hidden_units, eps=1e-6)
-            self.attention_layernorms.append(new_attn_layernorm)
-            new_attn_layer = FlashMultiHeadAttention(
-                args.hidden_units, args.num_heads, args.dropout_rate
-            )
-            self.attention_layers.append(new_attn_layer)
-            new_fwd_layernorm = RMSNorm(args.hidden_units, eps=1e-6)
-            self.forward_layernorms.append(new_fwd_layernorm)
-            new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
-            self.forward_layers.append(new_fwd_layer)
         for k in self.USER_SPARSE_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_SPARSE_FEAT:
@@ -222,88 +245,64 @@ class BaselineModel(torch.nn.Module):
             seqs_emb = all_item_emb
         return seqs_emb
 
-    def log2feats(self, log_seqs, mask, seq_feature):
-        batch_size = log_seqs.shape[0]
-        maxlen = log_seqs.shape[1]
+    def log2feats(self, log_seqs, mask, seq_feature, seq_timestamps):
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
+        seqs = self.feat_fusion_norm(seqs)
         seqs *= self.item_emb.embedding_dim**0.5
-        poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
-        poss *= log_seqs != 0
-        seqs += self.pos_emb(poss)
+        
+        seqs = self.input_norm(seqs)
         seqs = self.emb_dropout(seqs)
-        maxlen = seqs.shape[1]
-        ones_matrix = torch.ones((maxlen, maxlen), dtype=torch.bool, device=self.dev)
-        attention_mask_tril = torch.tril(ones_matrix)
-        attention_mask_pad = (mask != 0).to(self.dev)
-        attention_mask = attention_mask_tril.unsqueeze(0) & attention_mask_pad.unsqueeze(1)
-        for i in range(len(self.attention_layers)):
-            if self.norm_first:
-                x = self.attention_layernorms[i](seqs)
-                mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask)
-                seqs = seqs + mha_outputs
-                seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
-            else:
-                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
-                seqs = self.attention_layernorms[i](seqs + mha_outputs)
-                seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
+        
+        batch_size, maxlen, _ = seqs.shape
+        
+        position_ids = torch.arange(maxlen, device=self.dev).view(1, -1).expand(batch_size, -1)
+        
+        valid_ts_mask = (seq_timestamps != 0)
+        first_ts = (seq_timestamps + (~valid_ts_mask * 1e10)).min(dim=1, keepdim=True)[0]
+        time_deltas = torch.clamp(seq_timestamps - first_ts, min=0) * valid_ts_mask
+
+        cos, sin = self.rotary_emb(position_ids, time_deltas, maxlen)
+        cos = cos.to(seqs.dtype)
+        sin = sin.to(seqs.dtype)
+        
+        attention_mask_pad = (mask.to(self.dev) != 0)
+        causal_mask = torch.tril(torch.ones((maxlen, maxlen), dtype=torch.bool, device=self.dev))
+        attention_mask = causal_mask & attention_mask_pad.unsqueeze(1)
+        
+        for layer in self.hstu_layers:
+            seqs = layer(seqs, cos=cos, sin=sin, attn_mask=attention_mask)
+            
         log_feats = self.last_layernorm(seqs)
         return log_feats
 
     def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask):
         hidden_size = neg_embs.size(-1)
-        
         seq_embs_norm = seq_embs / seq_embs.norm(dim=-1, keepdim=True)
         pos_embs_norm = pos_embs / pos_embs.norm(dim=-1, keepdim=True)
         neg_embs_norm = neg_embs / neg_embs.norm(dim=-1, keepdim=True)
-
         pos_logits = F.cosine_similarity(seq_embs_norm, pos_embs_norm, dim=-1).unsqueeze(-1)
-        
         neg_embedding_all = neg_embs_norm.reshape(-1, hidden_size)
         neg_logits = torch.matmul(seq_embs_norm, neg_embedding_all.transpose(-1, -2))
-        
         logits = torch.cat([pos_logits, neg_logits], dim=-1)
-        
         logits = logits[loss_mask.bool()] / self.temp
-        
         if logits.size(0) == 0:
             return torch.tensor(0.0, device=self.dev)
-
         labels = torch.zeros(logits.size(0), device=logits.device, dtype=torch.int64)
-        
         loss = F.cross_entropy(logits, labels)
         return loss
 
-    def compute_triplet_loss(self, seq_embs, pos_embs, neg_embs, loss_mask):
-        anchor = seq_embs[loss_mask]
-        positive = pos_embs[loss_mask]
-        negative = neg_embs[loss_mask]
-
-        if anchor.size(0) == 0:
-            return torch.tensor(0.0, device=self.dev)
-            
-        return self.triplet_loss_fn(anchor, positive, negative)
-
-    def forward(self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature):
+    def forward(self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature, seq_timestamps):
         loss_mask = (next_mask == 1)
         if not loss_mask.any():
             return torch.tensor(0.0, device=self.dev, requires_grad=True)
-
-        log_feats = self.log2feats(user_item, mask, seq_feature)
+        log_feats = self.log2feats(user_item, mask, seq_feature, seq_timestamps)
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
-        
         infonce_loss = self.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask)
-        
-        total_loss = infonce_loss
-        if self.use_triplet_loss:
-            triplet_loss = self.compute_triplet_loss(log_feats, pos_embs, neg_embs, loss_mask)
-            w_infonce = self.infonce_loss_weight
-            total_loss = w_infonce * infonce_loss + (1 - w_infonce) * triplet_loss
-            
-        return total_loss
+        return infonce_loss
 
-    def predict(self, log_seqs, seq_feature, mask):
-        log_feats = self.log2feats(log_seqs, mask, seq_feature)
+    def predict(self, log_seqs, seq_feature, mask, seq_timestamps):
+        log_feats = self.log2feats(log_seqs, mask, seq_feature, seq_timestamps)
         final_feat = log_feats[:, -1, :]
         return final_feat
 
