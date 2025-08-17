@@ -54,6 +54,7 @@ bash run.sh         # 开始训练
 > - 学习率改为改为预热warm up+线性衰减weight deacy
 > - 修改dataset.py从数据中读出timestamp特征
 > - 修改代码框架，可视化正负样本相似度以及区分度
+> - 更新preprocess_data.py，能够正确处理原始数据用于提取其他特征
 
 > 表格中记录了训练产出的第3个epoch和第4个epoch模型的评测结果，说明模型仍在收敛，可以通过增加训练epoch数提升得分
 
